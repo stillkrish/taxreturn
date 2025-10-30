@@ -1,0 +1,8 @@
+streamlit
+pdfplumber
+pymupdf
+pytesseract
+reportlab
+pillow
+python-dotenv
+pypdf
