@@ -155,8 +155,14 @@ def parse_documents(files: List[Any]) -> Dict[str, Any]:
         # 1099-INT
         # --------------------------
         if "1099-int" in lower or "form 1099-int" in lower or "interest income" in lower:
-            parsed_int = parse_1099int(data, f.name)
+            try:
+                parsed_int = parse_1099int(data, f.name)
+            except Exception as e:
+                #st.warning(f"⚠️ Could not fully parse {f.name}: {e}")
+                continue
+
             parsed_docs["1099-INT"] = parsed_int
+
             try:
                 v = parsed_int["parsed_fields"].get("box_1_interest_income", "missing")
                 if v != "missing":
@@ -166,7 +172,9 @@ def parse_documents(files: List[Any]) -> Dict[str, Any]:
                     summary["withholding"]["federal"] += float(w.replace(",", ""))
             except Exception:
                 pass
+
             continue
+
 
         # --------------------------
         # Default: W-2
