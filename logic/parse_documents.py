@@ -6,24 +6,23 @@ import fitz  # PyMuPDF
 from PIL import Image
 import pytesseract
 
-# import the dedicated 1099-INT and 1099-NEC parsers
+# Dedicated 1099 parsers
 from logic.parse_1099int import parse_1099int
 from logic.parse_1099nec import parse_1099nec
 
 
 # ---------------------------
-# Text extraction w/ OCR
+# Text extraction (pdfplumber → PyMuPDF → OCR fallback)
 # ---------------------------
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     text = ""
-    # 1) pdfplumber
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
                 text += page.extract_text() or ""
     except Exception:
         pass
-    # 2) PyMuPDF
+
     if len(text.strip()) < 20:
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -31,7 +30,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
                 text += page.get_text() or ""
         except Exception:
             pass
-    # 3) OCR
+
     if len(text.strip()) < 20:
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -112,23 +111,35 @@ def find_ca_state_line_amount(text: str) -> str:
 # Main unified parser
 # ---------------------------
 def parse_documents(files: List[Any]) -> Dict[str, Any]:
-    results = []
-    summary = {"income": {"w2_wages": 0.0, "int_interest": 0.0, "nec_nonemployee_comp": 0.0},
-               "withholding": {"federal": 0.0}}
+    """
+    Identify each uploaded file (W-2, 1099-INT, 1099-NEC),
+    extract parsed fields and also compute summary totals for quick tax calculations.
+    """
+
+    parsed_docs = {}
+    summary = {
+        "income": {
+            "w2_wages": 0.0,
+            "int_interest": 0.0,
+            "nec_nonemployee_comp": 0.0,
+        },
+        "withholding": {"federal": 0.0},
+    }
 
     for f in files:
         data = f.read()
         f.seek(0)
 
-        # quick scan to detect form type
         full_text = extract_text_from_pdf(data)
         norm_full = normalize_spaces(full_text)
         lower = norm_full.lower()
 
-        # ---- detect 1099-NEC ----
+        # --------------------------
+        # 1099-NEC
+        # --------------------------
         if "1099-nec" in lower or "nonemployee compensation" in lower:
             parsed_nec = parse_1099nec(data, f.name)
-            # aggregate income / withholding
+            parsed_docs["1099-NEC"] = parsed_nec
             try:
                 v = parsed_nec["parsed_fields"].get("box_1_nonemployee_compensation", "missing")
                 if v != "missing":
@@ -138,12 +149,14 @@ def parse_documents(files: List[Any]) -> Dict[str, Any]:
                     summary["withholding"]["federal"] += float(w.replace(",", ""))
             except Exception:
                 pass
-            results.append(parsed_nec)
             continue
 
-        # ---- detect 1099-INT ----
+        # --------------------------
+        # 1099-INT
+        # --------------------------
         if "1099-int" in lower or "form 1099-int" in lower or "interest income" in lower:
             parsed_int = parse_1099int(data, f.name)
+            parsed_docs["1099-INT"] = parsed_int
             try:
                 v = parsed_int["parsed_fields"].get("box_1_interest_income", "missing")
                 if v != "missing":
@@ -153,10 +166,11 @@ def parse_documents(files: List[Any]) -> Dict[str, Any]:
                     summary["withholding"]["federal"] += float(w.replace(",", ""))
             except Exception:
                 pass
-            results.append(parsed_int)
             continue
 
-        # ---- default: treat as W-2 ----
+        # --------------------------
+        # Default: W-2
+        # --------------------------
         tokens = extract_words_in_copyB(data)
         first6 = first_n_currency_in_order(tokens, 6)
 
@@ -204,6 +218,7 @@ def parse_documents(files: List[Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
+        # detect SSN and EIN
         m_ssn = re.search(r"\b\d{3}-\d{2}-\d{4}\b", norm_full)
         if m_ssn:
             parsed["a_employee_ssn"] = m_ssn.group(0)
@@ -211,6 +226,7 @@ def parse_documents(files: List[Any]) -> Dict[str, Any]:
         if m_ein:
             parsed["b_employer_ein"] = m_ein.group(0)
 
+        # detect employer and employee address
         m_emp = re.search(r"cinemark\s+usa.*?plano,\s*tx\s*\d{5}", full_text, flags=re.IGNORECASE | re.DOTALL)
         if m_emp:
             parsed["c_employer_name_address_zip"] = normalize_spaces(m_emp.group(0))
@@ -227,15 +243,26 @@ def parse_documents(files: List[Any]) -> Dict[str, Any]:
 
         missing_fields = [k for k, v in parsed.items() if v == "missing"]
 
-        results.append({
+        parsed_docs["w2"] = {
             "filename": f.name,
             "form_type": "W-2",
             "parsed_fields": parsed,
             "missing_fields": missing_fields,
             "notes": [
                 f"Copy B top-left words extracted: {len(tokens)} tokens",
-                f"First 6 currency tokens (order-preserved): {first6}"
+                f"First 6 currency tokens (order-preserved): {first6}",
             ],
-        })
+        }
 
-    return {"summary": summary, "documents": results}
+    # --------------------------
+    # Final return payload
+    # --------------------------
+    return {
+        "summary": summary,           # quick totals for tax logic
+        "documents": parsed_docs,     # all individual forms with full parsed_fields
+        "raw_fields": {
+            "w2": parsed_docs.get("w2", {}),
+            "1099-INT": parsed_docs.get("1099-INT", {}),
+            "1099-NEC": parsed_docs.get("1099-NEC", {}),
+        },
+    }
